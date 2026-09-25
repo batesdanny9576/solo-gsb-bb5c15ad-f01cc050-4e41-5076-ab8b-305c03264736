@@ -495,6 +495,47 @@ class ReceivablesAgingSummary(BaseModel):
     currencies: list[AgingCurrencyOut]
 
 
+# ---- 期间税额归集 ----
+
+
+class TaxLedgerAmounts(BaseModel):
+    """一组同币种同税率金额的三个口径（均为该币种十进制字符串）。"""
+
+    model_config = ConfigDict(extra="allow")
+    net: str
+    tax: str
+    gross: str
+
+
+class TaxLedgerGroup(BaseModel):
+    """原币种 + 规范化税率维度的一组期间税额：开票 / 抵减 / 净额。
+
+    不使用换算列、不跨币种相加；``net = invoiced − credited``（净额可为负）。
+    """
+
+    model_config = ConfigDict(extra="allow")
+    currency: str
+    currency_digits: int
+    tax_rate: str
+    invoiced: TaxLedgerAmounts
+    credited: TaxLedgerAmounts
+    net: TaxLedgerAmounts
+
+
+class TaxLedgerSummary(BaseModel):
+    """期间税额归集：按 UTC 发生时间选取期间内保存的发票行与期间内创建的
+    贷项凭证行（贷项凭证即使对应更早期发票也计入本期抵减），按原币种与
+    原发票行税率（数值规范化）分组；分组按币种代码、税率数值升序固定排列，
+    空期间返回空列表。
+    """
+
+    start: str
+    end: str
+    period_start: str
+    period_end: str
+    groups: list[TaxLedgerGroup]
+
+
 # ---- 分期回款计划 ----
 
 

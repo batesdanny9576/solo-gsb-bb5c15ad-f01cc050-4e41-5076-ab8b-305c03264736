@@ -1758,3 +1758,148 @@ def receivables_aging_summary(
         "cutoff_at": cutoff_text,
         "currencies": currencies,
     }
+
+
+# ---- 期间税额归集 ----
+
+
+def _canon_rate(value: str) -> str:
+    """税率按**数值**规范化为分组键字符串。
+
+    入库时税率保留了提交时的写法（``'0.10'`` / ``'0.1'`` / ``'0.100'``），
+    归集分组必须按数值归一：先转 Decimal 再 ``normalize`` 去掉尾随零
+    （``-0`` 也归一成 ``0``），最后输出不带指数的固定形式。
+    """
+
+    rate = Decimal(value) - Decimal("0")
+    return format(rate.normalize(), "f")
+
+
+def tax_ledger(conn: sqlite3.Connection, start: date, end: date) -> dict[str, Any]:
+    """按 UTC 半开自然日闭区间汇总期间税额：开票、抵减、净额三组金额。
+
+    期间为 ``[start T00:00:00Z, end T23:59:59Z]``（首尾两天均完整计入），
+    库内 ``created_at`` 为定长 ``YYYY-MM-DDTHH:MM:SSZ`` UTC 文本，直接用
+    字符串字典序做闭区间比较。两类行各自按自身发生时间独立筛选：
+
+    * **开票**：``invoices.created_at`` 落在期间内的发票，其**全部发票行**
+      （``invoice_lines``，含负数冲红行，取原币 net/tax/gross）计入；
+    * **抵减**：``credit_memos.created_at`` 落在期间内的贷项凭证，其凭证行
+      （``credit_memo_lines``）计入——凭证按**创建期间**归属，即使被抵扣的
+      原发票开具于更早的期间也在本期抵减；凭证行本身不存税率，按
+      ``(invoice_id, line_no)`` 连接回**原发票行**取其税率。
+
+    分组维度为**原币种 + 原发票行税率（数值规范化）**：不读取任何换算列
+    （``conv_*``），不同币种绝不相加。金额全部在 Python 侧用 Decimal 累计，
+    最后按各币种最小单位取整，每组给出：
+
+    * ``invoiced``：期间开票净额/税额/含税额；
+    * ``credited``：期间抵减净额/税额/含税额；
+    * ``net``：净额 = 开票 − 抵减（三个金额维度分别相减，可为负）。
+
+    分组排序固定：币种代码升序、税率数值升序；期间内无任何行时返回空列表。
+    """
+
+    start_text = f"{start.isoformat()}T00:00:00Z"
+    end_text = f"{end.isoformat()}T23:59:59Z"
+
+    # key=(币种, 规范化税率) -> 累计器；unit 在首次出现该币种时固定
+    groups: dict[tuple[str, str], dict[str, Any]] = {}
+
+    def _bucket(currency: str, digits: int, rate_text: str) -> dict[str, Any]:
+        key = (currency, rate_text)
+        bucket = groups.get(key)
+        if bucket is None:
+            bucket = {
+                "currency": currency,
+                "currency_digits": digits,
+                "tax_rate": rate_text,
+                "unit": _minor_unit(digits),
+                "invoiced": [Decimal("0"), Decimal("0"), Decimal("0")],
+                "credited": [Decimal("0"), Decimal("0"), Decimal("0")],
+            }
+            groups[key] = bucket
+        return bucket
+
+    # 期间内保存的发票行（只用原币列，不使用 conv_* 换算列）
+    invoice_rows = conn.execute(
+        """
+        SELECT i.currency AS currency, i.currency_digits AS currency_digits,
+               l.tax_rate AS tax_rate, l.net AS net, l.tax AS tax, l.gross AS gross
+        FROM invoice_lines l
+        JOIN invoices i ON i.id = l.invoice_id
+        WHERE i.created_at >= ? AND i.created_at <= ?
+        """,
+        (start_text, end_text),
+    ).fetchall()
+    for r in invoice_rows:
+        bucket = _bucket(
+            r["currency"], int(r["currency_digits"]), _canon_rate(r["tax_rate"])
+        )
+        bucket["invoiced"][0] += Decimal(r["net"])
+        bucket["invoiced"][1] += Decimal(r["tax"])
+        bucket["invoiced"][2] += Decimal(r["gross"])
+
+    # 期间内创建的贷项凭证行；税率回原发票行取（凭证可对应更早期间开具的发票）
+    credit_rows = conn.execute(
+        """
+        SELECT i.currency AS currency, i.currency_digits AS currency_digits,
+               ol.tax_rate AS tax_rate,
+               cl.net AS net, cl.tax AS tax, cl.gross AS gross
+        FROM credit_memo_lines cl
+        JOIN credit_memos m ON m.id = cl.memo_id
+        JOIN invoices i ON i.id = m.invoice_id
+        JOIN invoice_lines ol
+          ON ol.invoice_id = m.invoice_id AND ol.line_no = cl.line_no
+        WHERE m.created_at >= ? AND m.created_at <= ?
+        """,
+        (start_text, end_text),
+    ).fetchall()
+    for r in credit_rows:
+        bucket = _bucket(
+            r["currency"], int(r["currency_digits"]), _canon_rate(r["tax_rate"])
+        )
+        bucket["credited"][0] += Decimal(r["net"])
+        bucket["credited"][1] += Decimal(r["tax"])
+        bucket["credited"][2] += Decimal(r["gross"])
+
+    ordered = sorted(
+        groups.values(),
+        key=lambda b: (b["currency"], Decimal(b["tax_rate"])),
+    )
+    items: list[dict[str, Any]] = []
+    for bucket in ordered:
+        unit = bucket["unit"]
+        invoiced = tuple(v.quantize(unit) for v in bucket["invoiced"])
+        credited = tuple(v.quantize(unit) for v in bucket["credited"])
+        net = tuple((invoiced[i] - credited[i]).quantize(unit) for i in range(3))
+        items.append(
+            {
+                "currency": bucket["currency"],
+                "currency_digits": bucket["currency_digits"],
+                "tax_rate": bucket["tax_rate"],
+                "invoiced": {
+                    "net": format(invoiced[0], "f"),
+                    "tax": format(invoiced[1], "f"),
+                    "gross": format(invoiced[2], "f"),
+                },
+                "credited": {
+                    "net": format(credited[0], "f"),
+                    "tax": format(credited[1], "f"),
+                    "gross": format(credited[2], "f"),
+                },
+                "net": {
+                    "net": format(net[0], "f"),
+                    "tax": format(net[1], "f"),
+                    "gross": format(net[2], "f"),
+                },
+            }
+        )
+
+    return {
+        "start": start.isoformat(),
+        "end": end.isoformat(),
+        "period_start": start_text,
+        "period_end": end_text,
+        "groups": items,
+    }
