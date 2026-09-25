@@ -42,6 +42,7 @@ from .schemas import (
     ReceivablesAgingSummary,
     ReversalCreate,
     ReversalResult,
+    TaxLedgerSummary,
     parse_iso_date,
     parse_utc_second,
 )
@@ -57,7 +58,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
 
 app = FastAPI(
     title="发票税额计算 API",
-    version="1.10.0",
+    version="1.11.0",
     description=(
         "基于 Decimal 的发票税额计算服务：按币种最小单位舍入、"
         "最大余数法分配残差、可复算，支持跨币种换算、收款登记与未收余额查询、"
@@ -71,6 +72,8 @@ app = FastAPI(
         "完全抵扣恰好抵完原行税额、不改写原发票与收款流水）、"
         "供应商发票号码批次查重（NFKC 规范化后同供应商内判重）、"
         "应收账龄汇总（查询日 UTC 结束时点、按币种分桶、不跨币种相加）、"
+        "期间税额归集（UTC 自然日闭区间，原币种 + 原发票行税率分组，"
+        "分别累计开票、贷项抵减与净额，不使用目标币换算列）、"
         "SQLite 持久化。"
     ),
     lifespan=lifespan,
@@ -652,3 +655,49 @@ def list_credit_memos(
     if row is None:
         raise HTTPException(status_code=404, detail=f"发票 {invoice_id} 不存在")
     return database.credit_memo_overview(conn, row)
+
+
+# ---- 期间税额归集 ----
+
+
+@app.get(
+    "/api/v1/tax-ledger",
+    response_model=TaxLedgerSummary,
+    tags=["tax-ledger"],
+)
+def tax_ledger(
+    start: str = Query(
+        ...,
+        description="期间起始日期 ISO 8601（YYYY-MM-DD），UTC 当日 00:00:00Z 起计入（含当日）",
+    ),
+    end: str = Query(
+        ...,
+        description="期间截止日期 ISO 8601（YYYY-MM-DD），UTC 当日 23:59:59Z 前均计入（含当日）",
+    ),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> dict[str, Any]:
+    """按 UTC 自然日闭区间归集期间开票与贷项抵减的税额台账。
+
+    选取口径（均按 UTC 发生时间）：
+
+    * **发票行**：``invoices.created_at`` 落在 ``start 00:00:00Z``（含）至
+      ``end 23:59:59Z``（含）之间的已保存发票的全部行；
+    * **贷项凭证行**：``credit_memos.created_at`` 落在同一区间的凭证行，
+      **即使对应发票更早期开票也计入本期抵减**；分组税率取自被抵扣的原发票行。
+
+    按**原币种 + 原发票行税率**分组：税率按数值规范化（``0.13`` 与 ``0.130``
+    同组），不同币种绝不混合；金额只取发票行原币列（不使用 ``conv_*`` 目标币
+    换算列），全程 Decimal 分别累计开票（``invoiced``）、抵减（``credited``）
+    与净额（``net = invoiced − credited``）的未税、税、含税金额。只有本期抵减、
+    本期未开票的分组同样列出。分组固定按币种代码升序、税率数值升序；期间内无
+    任何行时 ``groups`` 为空列表。日期非法或倒置（``end < start``）返回 422。
+    """
+
+    start_date = parse_iso_date(start, "start")
+    end_date = parse_iso_date(end, "end")
+    if end_date < start_date:
+        # 走全局 ValueError -> 422 处理器
+        raise ValueError(
+            f"截止日期 {end_date.isoformat()} 不能早于起始日期 {start_date.isoformat()}"
+        )
+    return database.tax_ledger_summary(conn, start_date, end_date)

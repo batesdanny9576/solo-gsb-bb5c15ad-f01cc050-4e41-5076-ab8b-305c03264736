@@ -1247,13 +1247,16 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(plan["invoice_id"], invoice_id)
         self.assertIn("plan_id", plan)
         self.assertIn("created_at", plan)
-        self.assertEqual(plan["as_of"], "2026-09-24")
+        # 创建响应的 as_of 取 UTC 当前日期（不写死具体日期，避免随时间失效）
+        from datetime import datetime, timezone
+        today = datetime.now(timezone.utc).date().isoformat()
+        self.assertEqual(plan["as_of"], today)
         self.assertEqual(plan["currency"], "USD")
         self.assertEqual(plan["total_gross"], "33.11")
         self.assertEqual(plan["net_paid"], "0.00")
         self.assertEqual(plan["covered_total"], "0.00")
         self.assertEqual(plan["uncovered_total"], "33.11")
-        # 创建时 as_of=2026-09-24：前两期已到期
+        # 创建时 as_of 为 UTC 当日（2026-09-01 之后、2026-10-15 之前）：前两期已到期
         self.assertEqual(plan["overdue_total"], "23.11")
         self.assertEqual(
             [(it["installment"], it["due_date"], it["amount"],
@@ -1266,8 +1269,8 @@ class ApiTests(unittest.TestCase):
             ],
         )
 
-        # GET 与 POST 返回同构视图
-        status, fetched = self._request("GET", f"{path}?as_of=2026-09-24")
+        # GET 与 POST 返回同构视图（用同一 as_of 显式查询）
+        status, fetched = self._request("GET", f"{path}?as_of={today}")
         self.assertEqual(status, 200, fetched)
         self.assertEqual(fetched, plan)
 
@@ -2495,6 +2498,194 @@ class ApiTests(unittest.TestCase):
         )
         self.assertEqual(status, 200)
         self.assertEqual(again, result)
+
+    def test_40_tax_ledger_grouping(self) -> None:
+        # 期间税额归集：UTC 自然日闭区间；原币种 + 规范化税率分组；
+        # 发票按保存时间、凭证按创建时间分别计入；不使用换算列；排序固定。
+        import sqlite3
+        from decimal import Decimal
+
+        db_file = os.environ["DB_PATH"]
+
+        def set_time(table: str, row_id: int, ts: str) -> None:
+            c = sqlite3.connect(db_file, timeout=30)
+            try:
+                c.execute(
+                    f"UPDATE {table} SET created_at = ? WHERE id = ?", (ts, row_id)
+                )
+                c.commit()
+            finally:
+                c.close()
+
+        def invoice(currency: str, lines, ts: str, fx: bool = False) -> int:
+            payload = {"currency": currency, "lines": lines}
+            if fx:
+                payload.update({"target_currency": "CNY", "exchange_rate": "5.5"})
+            status, body = self._request("POST", "/api/v1/invoices", payload)
+            self.assertEqual(status, 201, body)
+            set_time("invoices", body["id"], ts)
+            return body["id"]
+
+        def memo(invoice_id: int, items, ts: str) -> dict:
+            status, body = self._request(
+                "POST", f"/api/v1/invoices/{invoice_id}/credit-memos",
+                {"lines": [{"line_no": ln, "net": net} for ln, net in items]},
+            )
+            self.assertEqual(status, 201, body)
+            set_time("credit_memos", body["id"], ts)
+            return body
+
+        def ledger(start: str, end: str):
+            return self._request(
+                "GET", f"/api/v1/tax-ledger?start={start}&end={end}"
+            )
+
+        # SGD（2 位）2031-02 期间发票：
+        # a: 100.00 @0.10 + 50.00 @0.05；b: 10.00 @0.130；c: 20.00 @0.13；
+        # neg: -40.00 @0.2；bound_lo/bound_hi 验证起止日闭区间
+        a = invoice(
+            "SGD",
+            [{"net": "100.00", "tax_rate": "0.10"},
+             {"net": "50.00", "tax_rate": "0.05"}],
+            "2031-02-10T10:00:00Z",
+        )
+        invoice("SGD", [{"net": "10.00", "tax_rate": "0.130"}], "2031-02-11T08:00:00Z")
+        invoice("SGD", [{"net": "20.00", "tax_rate": "0.13"}], "2031-02-12T08:00:00Z")
+        invoice("JPY", [{"net": "1000", "tax_rate": "0.1"}], "2031-02-15T00:00:00Z")
+        invoice("SGD", [{"net": "-40.00", "tax_rate": "0.2"}], "2031-02-05T00:00:00Z")
+        invoice("SGD", [{"net": "1.00", "tax_rate": "0"}], "2031-02-01T00:00:00Z")
+        invoice("SGD", [{"net": "2.00", "tax_rate": "0"}], "2031-02-28T23:59:59Z")
+        # 带目标币换算的发票：归集金额仍是原币，不混入换算列
+        invoice(
+            "SGD", [{"net": "10.00", "tax_rate": "0.1"}],
+            "2031-02-25T00:00:00Z", fx=True,
+        )
+        # 期间外发票：3 月开票排除；1 月发票本期不开票但其本期凭证仍计入抵减
+        invoice("SGD", [{"net": "5.00", "tax_rate": "0.1"}], "2031-03-01T00:00:00Z")
+        old = invoice(
+            "SGD", [{"net": "10.00", "tax_rate": "0.13"}], "2031-01-15T00:00:00Z"
+        )
+
+        # 贷项凭证：本期创建即计入本期抵减（即使对应 1 月开票）；
+        # 3 月创建的凭证不进入 2 月期间
+        m = memo(a, [(1, "10.00")], "2031-02-20T09:00:00Z")
+        self.assertEqual((m["lines"][0]["net"], m["lines"][0]["tax"]), ("10.00", "1.00"))
+        memo(old, [(1, "5.00")], "2031-02-21T09:00:00Z")  # round(1.30*5/10)=0.65
+        memo(a, [(1, "20.00")], "2031-03-05T09:00:00Z")
+
+        status, body = ledger("2031-02-01", "2031-02-28")
+        self.assertEqual(status, 200, body)
+        self.assertEqual(
+            body,
+            {
+                "start_date": "2031-02-01",
+                "end_date": "2031-02-28",
+                "period_start": "2031-02-01T00:00:00Z",
+                "period_end": "2031-02-28T23:59:59Z",
+                "groups": [
+                    {"currency": "JPY", "currency_digits": 0, "tax_rate": "0.1",
+                     "invoiced": {"net": "1000", "tax": "100", "gross": "1100"},
+                     "credited": {"net": "0", "tax": "0", "gross": "0"},
+                     "net": {"net": "1000", "tax": "100", "gross": "1100"}},
+                    {"currency": "SGD", "currency_digits": 2, "tax_rate": "0",
+                     "invoiced": {"net": "3.00", "tax": "0.00", "gross": "3.00"},
+                     "credited": {"net": "0.00", "tax": "0.00", "gross": "0.00"},
+                     "net": {"net": "3.00", "tax": "0.00", "gross": "3.00"}},
+                    {"currency": "SGD", "currency_digits": 2, "tax_rate": "0.05",
+                     "invoiced": {"net": "50.00", "tax": "2.50", "gross": "52.50"},
+                     "credited": {"net": "0.00", "tax": "0.00", "gross": "0.00"},
+                     "net": {"net": "50.00", "tax": "2.50", "gross": "52.50"}},
+                    {"currency": "SGD", "currency_digits": 2, "tax_rate": "0.1",
+                     # 100.00（a 行1）+ 10.00（带换算发票）；抵减 10.00
+                     "invoiced": {"net": "110.00", "tax": "11.00", "gross": "121.00"},
+                     "credited": {"net": "10.00", "tax": "1.00", "gross": "11.00"},
+                     "net": {"net": "100.00", "tax": "10.00", "gross": "110.00"}},
+                    {"currency": "SGD", "currency_digits": 2, "tax_rate": "0.13",
+                     # 0.130 与 0.13 数值规范化后同组：10+20；抵减来自 1 月发票
+                     "invoiced": {"net": "30.00", "tax": "3.90", "gross": "33.90"},
+                     "credited": {"net": "5.00", "tax": "0.65", "gross": "5.65"},
+                     "net": {"net": "25.00", "tax": "3.25", "gross": "28.25"}},
+                    {"currency": "SGD", "currency_digits": 2, "tax_rate": "0.2",
+                     "invoiced": {"net": "-40.00", "tax": "-8.00", "gross": "-48.00"},
+                     "credited": {"net": "0.00", "tax": "0.00", "gross": "0.00"},
+                     "net": {"net": "-40.00", "tax": "-8.00", "gross": "-48.00"}},
+                ],
+            },
+        )
+
+        # 分组排序固定：币种升序，同币种税率数值升序
+        keys = [(g["currency"], g["tax_rate"]) for g in body["groups"]]
+        self.assertEqual(
+            keys,
+            [("JPY", "0.1"), ("SGD", "0"), ("SGD", "0.05"),
+             ("SGD", "0.1"), ("SGD", "0.13"), ("SGD", "0.2")],
+        )
+        # 每组恒有 net = invoiced - credited（未税/税/含税各列）
+        for g in body["groups"]:
+            for col in ("net", "tax", "gross"):
+                self.assertEqual(
+                    Decimal(g["net"][col]),
+                    Decimal(g["invoiced"][col]) - Decimal(g["credited"][col]),
+                )
+
+        # 1 月：仅 1 月开票，本期无任何凭证 -> 该组 credited 全 0
+        status, jan = ledger("2031-01-01", "2031-01-31")
+        self.assertEqual(status, 200, jan)
+        self.assertEqual(
+            jan["groups"],
+            [{"currency": "SGD", "currency_digits": 2, "tax_rate": "0.13",
+              "invoiced": {"net": "10.00", "tax": "1.30", "gross": "11.30"},
+              "credited": {"net": "0.00", "tax": "0.00", "gross": "0.00"},
+              "net": {"net": "10.00", "tax": "1.30", "gross": "11.30"}}],
+        )
+
+        # 3 月：3 月发票与 3 月凭证（抵 a 行1 再 20.00 -> tax 2.00），净额为负
+        status, mar = ledger("2031-03-01", "2031-03-31")
+        self.assertEqual(status, 200, mar)
+        self.assertEqual(
+            mar["groups"],
+            [{"currency": "SGD", "currency_digits": 2, "tax_rate": "0.1",
+              "invoiced": {"net": "5.00", "tax": "0.50", "gross": "5.50"},
+              "credited": {"net": "20.00", "tax": "2.00", "gross": "22.00"},
+              "net": {"net": "-15.00", "tax": "-1.50", "gross": "-16.50"}}],
+        )
+
+        # 空期间 -> 空分组（字段仍回显）
+        status, empty = ledger("2032-01-01", "2032-01-31")
+        self.assertEqual(status, 200, empty)
+        self.assertEqual(empty["groups"], [])
+        self.assertEqual(empty["start_date"], "2032-01-01")
+        self.assertEqual(empty["period_end"], "2032-01-31T23:59:59Z")
+
+    def test_41_tax_ledger_validation(self) -> None:
+        # 缺参数 / 非法日期 / 倒置日期 -> 422
+        def ledger(path: str):
+            return self._request("GET", path)
+
+        for path in (
+            "/api/v1/tax-ledger",
+            "/api/v1/tax-ledger?start=2031-02-01",
+            "/api/v1/tax-ledger?end=2031-02-28",
+        ):
+            status, body = ledger(path)
+            self.assertEqual(status, 422, path)
+
+        # 缺参数的 422 为 FastAPI 校验错误列表
+        status, body = ledger("/api/v1/tax-ledger")
+        self.assertIsInstance(body["detail"], list)
+
+        # 非法/倒置日期走全局 ValueError -> 422 {"detail": "..."}
+        for bad in (
+            "start=2031-13-01&end=2031-02-28",
+            "start=2031-02-30&end=2031-03-01",
+            "start=2031-02-01T00:00:00Z&end=2031-02-28",
+            "start=abc&end=2031-02-28",
+            "start=2031-03-02&end=2031-03-01",
+            "start=2031-03-02&end=2031-03-01",
+        ):
+            status, body = ledger(f"/api/v1/tax-ledger?{bad}")
+            self.assertEqual(status, 422, bad)
+            self.assertIsInstance(body["detail"], str, bad)
 
 
 if __name__ == "__main__":

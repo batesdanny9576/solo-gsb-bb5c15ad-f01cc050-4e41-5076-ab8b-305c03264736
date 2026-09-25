@@ -1758,3 +1758,132 @@ def receivables_aging_summary(
         "cutoff_at": cutoff_text,
         "currencies": currencies,
     }
+
+
+# ---- 期间税额归集 ----
+
+
+def _normalize_tax_rate(rate_text: str) -> tuple[Decimal, str]:
+    """税率按**数值**规范化，返回 ``(数值 Decimal, 规范文本)``。
+
+    ``"0.13"``、``"0.130"`` 数值相同即视为同一税率，归入同一分组；规范文本取
+    ``Decimal.normalize()`` 后的无指数形式（``0.130 -> "0.13"``、``0.00 -> "0"``）。
+    """
+
+    value = Decimal(rate_text)
+    canonical = value - Decimal(0)  # -0 归一为 +0
+    return value, format(canonical.normalize(), "f")
+
+
+def tax_ledger_summary(
+    conn: sqlite3.Connection, start: date, end: date
+) -> dict[str, Any]:
+    """按 UTC 自然日闭区间归集期间开票与贷项抵减，按原币种 + 原发票行税率分组。
+
+    期间边界（均为 UTC，闭区间）：
+
+    * ``start 00:00:00Z``（含）~ ``end 23:59:59Z``（含），与库内秒精度 UTC
+      文本同构，直接用字符串字典序比较；
+    * **发票行**按发票保存时间（``invoices.created_at``）选取；
+    * **贷项凭证行**按**凭证创建时间**（``credit_memos.created_at``）选取——即使
+      对应发票更早期开票，抵减也计入凭证所在期间；凭证行税率取自被抵扣的原发票行。
+
+    分组键为 ``(原币种, 规范化税率文本)``：税率按数值规范化（``0.13`` 与
+    ``0.130`` 同组），不同币种绝不合并。金额只取发票行的**原币列**
+    （``net/tax/gross``），不读取 ``conv_*`` 换算列；逐行在 Python 侧用 Decimal
+    累计（不走 SQLite 浮点聚合），每组分别给出开票（``invoiced``）、抵减
+    （``credited``）与净额（``net = 开票 − 抵减``）的未税/税/含税金额，最后按该
+    币种最小单位取整。只有本期抵减、本期未开票的分组（凭证对应更早期发票）同样
+    列出。分组固定按币种代码升序、税率**数值**升序排列；期间内无任何行时分组为空。
+    """
+
+    period_start = f"{start.isoformat()}T00:00:00Z"
+    period_end = f"{end.isoformat()}T23:59:59Z"
+
+    # 期间内保存的发票行（只用原币列，不读 conv_* 换算列）
+    invoice_rows = conn.execute(
+        """
+        SELECT i.currency AS currency, i.currency_digits AS currency_digits,
+               l.tax_rate AS tax_rate, l.net AS net, l.tax AS tax, l.gross AS gross
+        FROM invoice_lines l
+        JOIN invoices i ON i.id = l.invoice_id
+        WHERE i.created_at >= ? AND i.created_at <= ?
+        """,
+        (period_start, period_end),
+    ).fetchall()
+
+    # 期间内创建的贷项凭证行；税率取自被抵扣的原发票行，币种取自原发票，
+    # 选取只看凭证自身创建时间——原发票更早开票不影响其计入本期抵减
+    credit_rows = conn.execute(
+        """
+        SELECT i.currency AS currency, i.currency_digits AS currency_digits,
+               ol.tax_rate AS tax_rate, l.net AS net, l.tax AS tax, l.gross AS gross
+        FROM credit_memo_lines l
+        JOIN credit_memos m ON m.id = l.memo_id
+        JOIN invoices i ON i.id = m.invoice_id
+        JOIN invoice_lines ol ON ol.invoice_id = i.id AND ol.line_no = l.line_no
+        WHERE m.created_at >= ? AND m.created_at <= ?
+        """,
+        (period_start, period_end),
+    ).fetchall()
+
+    # key=(币种, 规范税率文本) -> 累加器；金额逐行 Decimal 求和，不使用浮点聚合
+    accum: dict[tuple[str, str], dict[str, Any]] = {}
+
+    def _accumulate(rows: list[sqlite3.Row], side: str) -> None:
+        for r in rows:
+            currency = r["currency"]
+            digits = int(r["currency_digits"])
+            rate_value, rate_text = _normalize_tax_rate(r["tax_rate"])
+            key = (currency, rate_text)
+            bucket = accum.get(key)
+            if bucket is None:
+                bucket = {
+                    "currency": currency,
+                    "currency_digits": digits,
+                    "rate_value": rate_value,
+                    "invoiced": [Decimal("0"), Decimal("0"), Decimal("0")],
+                    "credited": [Decimal("0"), Decimal("0"), Decimal("0")],
+                }
+                accum[key] = bucket
+            amounts = bucket[side]
+            amounts[0] += Decimal(r["net"])
+            amounts[1] += Decimal(r["tax"])
+            amounts[2] += Decimal(r["gross"])
+
+    _accumulate(list(invoice_rows), "invoiced")
+    _accumulate(list(credit_rows), "credited")
+
+    groups: list[dict[str, Any]] = []
+    for key in sorted(accum, key=lambda k: (k[0], accum[k]["rate_value"])):
+        bucket = accum[key]
+        unit = _minor_unit(bucket["currency_digits"])
+        invoiced = [v.quantize(unit) for v in bucket["invoiced"]]
+        credited = [v.quantize(unit) for v in bucket["credited"]]
+        net_amounts = [invoiced[i] - credited[i] for i in range(3)]
+
+        def _block(values: list[Decimal]) -> dict[str, str]:
+            return {
+                "net": format(values[0], "f"),
+                "tax": format(values[1], "f"),
+                "gross": format(values[2], "f"),
+            }
+
+        groups.append(
+            {
+                "currency": bucket["currency"],
+                "currency_digits": bucket["currency_digits"],
+                "tax_rate": key[1],
+                "invoiced": _block(invoiced),
+                "credited": _block(credited),
+                "net": _block(net_amounts),
+            }
+        )
+
+    return {
+        "start_date": start.isoformat(),
+        "end_date": end.isoformat(),
+        "period_start": period_start,
+        "period_end": period_end,
+        "groups": groups,
+    }

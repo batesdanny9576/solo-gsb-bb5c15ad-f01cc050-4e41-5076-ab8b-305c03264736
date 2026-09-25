@@ -744,3 +744,42 @@ class CreditMemoOverview(BaseModel):
     credited_gross: str
     line_credits: list[CreditMemoLineCumulative]
     memos: list[CreditMemoResult]
+
+
+# ---- 期间税额归集 ----
+
+
+class TaxLedgerAmounts(BaseModel):
+    """一个税额分组中某一口径（开票/抵减/净额）的未税、税、含税金额。"""
+
+    model_config = ConfigDict(extra="allow")
+    net: str
+    tax: str
+    gross: str
+
+
+class TaxLedgerGroup(BaseModel):
+    """原币种 + 原发票行税率下的期间开票、抵减与净额（net = invoiced − credited）。"""
+
+    model_config = ConfigDict(extra="allow")
+    currency: str
+    currency_digits: int
+    tax_rate: str
+    invoiced: TaxLedgerAmounts
+    credited: TaxLedgerAmounts
+    net: TaxLedgerAmounts
+
+
+class TaxLedgerSummary(BaseModel):
+    """期间税额归集：按 UTC 自然日闭区间选取发票行与贷项凭证行，原币种/税率分组。
+
+    发票行按发票保存时间、贷项凭证行按凭证创建时间分别落入期间；凭证即使对应
+    更早期开票也计入本期抵减。金额只取原币列（不使用目标币换算列），分组固定
+    按币种代码升序、税率数值升序；期间内无任何行时 ``groups`` 为空列表。
+    """
+
+    start_date: str
+    end_date: str
+    period_start: str
+    period_end: str
+    groups: list[TaxLedgerGroup]
